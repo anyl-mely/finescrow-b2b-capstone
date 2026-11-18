@@ -1,0 +1,176 @@
+import type pg from 'pg';
+import { AppError } from '../middlewares/security.middleware.js';
+
+export interface ContractDetailsView {
+    contractId: string;
+    contractCode: string;
+    status: string;
+    totalAmount: string;
+    participantRole: string;
+}
+
+export interface SettlementResult {
+    milestoneId: string;
+    contractId: string;
+    releasedAmount: string;
+    referenceCode: string;
+}
+
+export class EscrowPgRepository {
+    constructor(private readonly pool: pg.Pool) { }
+
+    // [Mục 5.3] Chống IDOR ngay tại tầng truy vấn dữ liệu
+    async getContractForParticipant(
+        contractId: string,
+        organizationId: string
+    ): Promise<ContractDetailsView> {
+        const res = await this.pool.query<{
+            contract_id: string;
+            contract_code: string;
+            status: string;
+            total_amount: string;
+            role: string;
+        }>(
+            `SELECT
+         c.id AS contract_id,
+         c.contract_code,
+         c.status,
+         c.total_amount::text,
+         cp.role
+       FROM escrow_contracts c
+       INNER JOIN contract_participants cp ON cp.contract_id = c.id
+       WHERE c.id = $1 AND cp.organization_id = $2`,
+            [contractId, organizationId]
+        );
+
+        const row = res.rows[0];
+        if (!row) {
+            throw new AppError(
+                403,
+                'FORBIDDEN_IDOR',
+                'Chốt chặn IDOR: Doanh nghiệp của bạn không có quyền truy cập hợp đồng này.'
+            );
+        }
+
+        return {
+            contractId: row.contract_id,
+            contractCode: row.contract_code,
+            status: row.status,
+            totalAmount: row.total_amount,
+            participantRole: row.role,
+        };
+    }
+
+    // [Mục 5.2 & 4.4] Interactive Transaction nguyên tử + Khóa dòng FOR UPDATE
+    async settleMilestoneAtomic(params: {
+        contractId: string;
+        milestoneId: string;
+        callerOrgId: string;
+        referenceCode: string;
+    }): Promise<SettlementResult> {
+        const client = await this.pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // 1. Kiểm tra Hard RBAC & Chống IDOR: Chỉ BUYER hoặc ARBITRATOR của đúng hợp đồng đó mới được giải ngân
+            const permRes = await client.query<{ role: string }>(
+                `SELECT role
+         FROM contract_participants
+         WHERE contract_id = $1 AND organization_id = $2`,
+                [params.contractId, params.callerOrgId]
+            );
+            const participant = permRes.rows[0];
+            if (!participant || (participant.role !== 'BUYER' && participant.role !== 'ARBITRATOR')) {
+                throw new AppError(
+                    403,
+                    'FORBIDDEN_RBAC_IDOR',
+                    'Chỉ Bên Mua hoặc Trọng Tài thuộc hợp đồng này mới có quyền giải ngân.'
+                );
+            }
+
+            // 2. Khóa dòng Milestone bằng SELECT ... FOR UPDATE chống Race Condition
+            const msRes = await client.query<{ id: string; status: string; amount: string }>(
+                `SELECT id, status, amount::text
+         FROM contract_milestones
+         WHERE id = $1 AND contract_id = $2
+         FOR UPDATE`,
+                [params.milestoneId, params.contractId]
+            );
+            const milestone = msRes.rows[0];
+            if (!milestone) {
+                throw new AppError(404, 'MILESTONE_NOT_FOUND', 'Không tìm thấy đợt thanh toán.');
+            }
+            if (milestone.status !== 'LOCKED') {
+                throw new AppError(
+                    409,
+                    'MILESTONE_ALREADY_PROCESSED',
+                    `Đợt thanh toán đã ở trạng thái ${milestone.status}.`
+                );
+            }
+
+            // 3. Lấy ví của Bên Mua và Bên Bán trong hợp đồng
+            const walletsRes = await client.query<{ wallet_id: string; role: string }>(
+                `SELECT w.id AS wallet_id, cp.role
+         FROM contract_participants cp
+         INNER JOIN escrow_wallets w ON w.organization_id = cp.organization_id
+         WHERE cp.contract_id = $1 AND cp.role IN ('BUYER', 'SELLER')
+         FOR UPDATE OF w`,
+                [params.contractId]
+            );
+
+            const buyerWallet = walletsRes.rows.find((r) => r.role === 'BUYER');
+            const sellerWallet = walletsRes.rows.find((r) => r.role === 'SELLER');
+            if (!buyerWallet || !sellerWallet) {
+                throw new AppError(422, 'WALLET_CONFIG_MISSING', 'Thiếu cấu hình ví Bên Mua hoặc Bên Bán.');
+            }
+
+            // 4. Trừ locked_balance ví Mua & Cộng available_balance ví Bán
+            await client.query(
+                `UPDATE escrow_wallets SET locked_balance = locked_balance - $1, updated_at = NOW() WHERE id = $2`,
+                [milestone.amount, buyerWallet.wallet_id]
+            );
+            await client.query(
+                `UPDATE escrow_wallets SET available_balance = available_balance + $1, updated_at = NOW() WHERE id = $2`,
+                [milestone.amount, sellerWallet.wallet_id]
+            );
+
+            // 5. Ghi cặp bút toán Sổ cái kép (DEBIT = CREDIT)
+            await client.query(
+                `INSERT INTO ledger_entries (wallet_id, contract_id, entry_type, amount, reference_code)
+         VALUES
+           ($1, $3, 'DEBIT', $4, $5),
+           ($2, $3, 'CREDIT', $4, $5)`,
+                [
+                    buyerWallet.wallet_id,
+                    sellerWallet.wallet_id,
+                    params.contractId,
+                    milestone.amount,
+                    params.referenceCode,
+                ]
+            );
+
+            // 6. Cập nhật trạng thái Milestone và Hợp đồng
+            await client.query(
+                `UPDATE contract_milestones SET status = 'RELEASED', released_at = NOW() WHERE id = $1`,
+                [milestone.id]
+            );
+            await client.query(
+                `UPDATE escrow_contracts SET status = 'RELEASED' WHERE id = $1`,
+                [params.contractId]
+            );
+
+            await client.query('COMMIT');
+            return {
+                milestoneId: milestone.id,
+                contractId: params.contractId,
+                releasedAmount: milestone.amount,
+                referenceCode: params.referenceCode,
+            };
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
+    }
+}

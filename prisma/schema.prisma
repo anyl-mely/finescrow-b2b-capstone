@@ -1,0 +1,85 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id           String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orgCode      String                @unique @map("org_code") @db.VarChar(32)
+  legalName    String                @map("legal_name") @db.VarChar(150)
+  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  wallet       EscrowWallet?
+  participants ContractParticipant[]
+
+  @@map("organizations")
+}
+
+model EscrowWallet {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String        @unique @map("organization_id") @db.Uuid
+  currency         String        @default("USD") @db.Char(3)
+  availableBalance Decimal       @default(0.0000) @map("available_balance") @db.Decimal(19, 4)
+  lockedBalance    Decimal       @default(0.0000) @map("locked_balance") @db.Decimal(19, 4)
+  updatedAt        DateTime      @default(now()) @map("updated_at") @db.Timestamptz(6)
+  organization     Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  ledgerEntries    LedgerEntry[]
+
+  @@map("escrow_wallets")
+}
+
+model EscrowContract {
+  id            String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contractCode  String                @unique @map("contract_code") @db.VarChar(50)
+  status        String                @db.VarChar(20)
+  totalAmount   Decimal               @map("total_amount") @db.Decimal(19, 4)
+  metadata      Json                  @default("{}") @db.JsonB
+  createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  participants  ContractParticipant[]
+  milestones    ContractMilestone[]
+  ledgerEntries LedgerEntry[]
+
+  @@map("escrow_contracts")
+}
+
+model ContractParticipant {
+  contractId     String         @map("contract_id") @db.Uuid
+  organizationId String         @map("organization_id") @db.Uuid
+  role           String         @db.VarChar(20)
+  joinedAt       DateTime       @default(now()) @map("joined_at") @db.Timestamptz(6)
+  contract       EscrowContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@id([contractId, organizationId, role])
+  @@map("contract_participants")
+}
+
+model ContractMilestone {
+  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contractId    String         @map("contract_id") @db.Uuid
+  milestoneCode String         @unique @map("milestone_code") @db.VarChar(50)
+  amount        Decimal        @db.Decimal(19, 4)
+  status        String         @db.VarChar(20)
+  releasedAt    DateTime?      @map("released_at") @db.Timestamptz(6)
+  contract      EscrowContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  @@map("contract_milestones")
+}
+
+model LedgerEntry {
+  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId      String         @map("wallet_id") @db.Uuid
+  contractId    String         @map("contract_id") @db.Uuid
+  entryType     String         @map("entry_type") @db.VarChar(10)
+  amount        Decimal        @db.Decimal(19, 4)
+  referenceCode String         @map("reference_code") @db.VarChar(64)
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  wallet        EscrowWallet   @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  contract      EscrowContract @relation(fields: [contractId], references: [id], onDelete: Restrict)
+
+  @@index([walletId, createdAt(sort: Desc)], map: "idx_ledger_wallet_created")
+  @@map("ledger_entries")
+}
