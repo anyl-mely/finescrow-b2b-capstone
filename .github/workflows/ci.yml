@@ -30,12 +30,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
-      - name: Install dependencies
-        run: npm install
+      - name: Clean install Linux dependencies
+        run: |
+          rm -rf node_modules
+          npm install
+          npm install -D typescript tsx @types/node @types/express @types/pg vitest supertest @types/supertest
 
       - name: Initialize PostgreSQL schemas via Node pg
         run: |
@@ -50,7 +54,7 @@ jobs:
           "
 
       - name: TypeScript Strict Check
-        run: npx tsc --noEmit
+        run: node ./node_modules/typescript/bin/tsc --noEmit
 
       - name: Run Sequential Vitest Suite
-        run: npx vitest run src/v1.supertest.spec.ts src/v2_v3.capstone.spec.ts --no-file-parallelism
+        run: node ./node_modules/vitest/vitest.mjs run src/v1.supertest.spec.ts src/v2_v3.capstone.spec.ts --no-file-parallelism
