@@ -14,19 +14,19 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
+          --health-cmd "pg_isready -U finescrow_admin -d finescrow_db"
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
       redis:
         image: redis:7-alpine
         ports:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
-          --health-interval 10s
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
 
     steps:
       - uses: actions/checkout@v4
@@ -37,16 +37,20 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Initialize PostgreSQL schemas (GĐ 4, 6 & 7)
-        env:
-          PGPASSWORD: finescrow_secret_2026
+      - name: Initialize PostgreSQL schemas via Node pg
         run: |
-          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/01_schema_3nf_and_indexes.sql
-          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/02_seed_500k_and_analytics.sql
-          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/03_v2_rag_and_v3_agent_schema.sql
+          node --input-type=module -e "
+            import fs from 'node:fs';
+            import pg from 'pg';
+            const pool = new pg.Pool({ connectionString: 'postgresql://finescrow_admin:finescrow_secret_2026@127.0.0.1:5432/finescrow_db' });
+            for (const file of ['sql/01_schema_3nf_and_indexes.sql', 'sql/02_seed_500k_and_analytics.sql', 'sql/03_v2_rag_and_v3_agent_schema.sql']) {
+              await pool.query(fs.readFileSync(file, 'utf8'));
+            }
+            await pool.end();
+          "
 
       - name: TypeScript Strict Check
-        run: npm run typecheck
+        run: npx tsc --noEmit
 
-      - name: Run Sequential Test Suite (v1.0, v2.0 & v3.0)
-        run: npm test
+      - name: Run Sequential Vitest Suite
+        run: npx vitest run src/v1.supertest.spec.ts src/v2_v3.capstone.spec.ts --no-file-parallelism
