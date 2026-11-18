@@ -1,8 +1,8 @@
-name: FinEscrow v1.0 CI Pipeline
+name: FinEscrow Fullstack CI Pipeline
 on: [push, pull_request]
 
 jobs:
-  verify-backend-v1:
+  verify-finescrow-capstone:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -13,15 +13,40 @@ jobs:
           POSTGRES_DB: finescrow_db
         ports:
           - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
       redis:
         image: redis:7-alpine
         ports:
           - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
-      - run: npx tsc --noEmit
-      - run: npx vitest run
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Initialize PostgreSQL schemas (GĐ 4, 6 & 7)
+        env:
+          PGPASSWORD: finescrow_secret_2026
+        run: |
+          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/01_schema_3nf_and_indexes.sql
+          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/02_seed_500k_and_analytics.sql
+          psql -h 127.0.0.1 -U finescrow_admin -d finescrow_db -f sql/03_v2_rag_and_v3_agent_schema.sql
+
+      - name: TypeScript Strict Check
+        run: npm run typecheck
+
+      - name: Run Sequential Test Suite (v1.0, v2.0 & v3.0)
+        run: npm test
