@@ -3,9 +3,6 @@ import { AppError, type AuthContext } from '../middlewares/security.middleware.j
 import type { EscrowV1Service } from './escrow.v1.service.js';
 import type { RagV2Service } from './rag.v2.service.js';
 
-// ============================================================================
-// [Mục 7.4] COST & LATENCY BUDGETING: 3 ngưỡng chặn cứng bắt buộc
-// ============================================================================
 export interface AgentBudgetConfig {
     maxIterations: number;
     executionTimeoutMs: number;
@@ -72,11 +69,7 @@ export class AutonomousDisputeAgent {
         );
     }
 
-    private assertWithinBudget(
-        memory: AgentWorkingMemory,
-        budget: AgentBudgetConfig,
-        startedAtMs: number
-    ): void {
+    private assertWithinBudget(memory: AgentWorkingMemory, budget: AgentBudgetConfig, startedAtMs: number): void {
         if (memory.iterationsUsed >= budget.maxIterations) {
             throw new AppError(429, 'AGENT_MAX_ITERATIONS_EXCEEDED', 'Agent đã chạm trần số vòng lặp maxIterations.');
         }
@@ -88,7 +81,6 @@ export class AutonomousDisputeAgent {
         }
     }
 
-    // [Mục 7.1, 7.2, 7.3 & 7.4] Chạy đồ thị trạng thái State Machine đến điểm dừng HITL
     async runDisputeWorkflow(params: {
         threadId: string;
         jwtContext: AuthContext;
@@ -111,17 +103,16 @@ export class AutonomousDisputeAgent {
             disputeClaim: params.disputeClaim,
             retrievedClauses: [],
             proposedBuyerRefundPct: params.initialDraftSplit?.buyerPct ?? 30,
-            proposedSellerPayoutPct: params.initialDraftSplit?.sellerPct ?? 80, // Giả lập tổng 110% để kích hoạt Self-Correction
+            proposedSellerPayoutPct: params.initialDraftSplit?.sellerPct ?? 80,
             selfCorrectionCount: 0,
             tokensUsed: 1500,
             iterationsUsed: 1,
         };
 
-        // NODE 1: RetrieveEvidenceNode (Gọi Tool Mức 0 — Chỉ đọc, có tiêm jwtContext.organizationId)
         this.assertWithinBudget(memory, budget, startedAt);
         const ragMatches = await this.ragService.hybridSearchRbac({
             contractId: params.contractId,
-            callerOrgId: params.jwtContext.organizationId, // [Mục 7.1] Security Context Injection từ JWT
+            callerOrgId: params.jwtContext.organizationId,
             queryText: params.disputeClaim,
             topK: 2,
         });
@@ -145,11 +136,8 @@ export class AutonomousDisputeAgent {
             memory,
         });
 
-        // NODE 2: FreezeContractNode (Gọi Tool Mức 1 — Tự động tạm khóa hợp đồng đang khiếu nại)
         this.assertWithinBudget(memory, budget, startedAt);
-        await this.pool.query(`UPDATE escrow_contracts SET status = 'DISPUTED' WHERE id = $1`, [
-            params.contractId,
-        ]);
+        await this.pool.query(`UPDATE escrow_contracts SET status = 'DISPUTED' WHERE id = $1`, [params.contractId]);
         memory.tokensUsed += 1200;
         memory.iterationsUsed += 1;
 
@@ -169,7 +157,6 @@ export class AutonomousDisputeAgent {
             memory,
         });
 
-        // NODE 3: CriticAndSelfCorrectionNode ([Mục 7.2] Vòng lặp tự phục hồi lỗi khi tổng tỷ lệ != 100%)
         this.assertWithinBudget(memory, budget, startedAt);
         if (memory.proposedBuyerRefundPct + memory.proposedSellerPayoutPct !== 100) {
             memory.selfCorrectionCount += 1;
@@ -179,7 +166,6 @@ export class AutonomousDisputeAgent {
         memory.tokensUsed += 1500;
         memory.iterationsUsed += 1;
 
-        // NODE 4: RiskGateNode ([Mục 7.1 & 7.5] Chạm Tool Mức 2 -> Đóng băng đồ thị chờ HITL phê duyệt)
         await this.writeImmutableAuditLog({
             threadId: params.threadId,
             jwtContext: params.jwtContext,
@@ -202,14 +188,9 @@ export class AutonomousDisputeAgent {
             memory,
         });
 
-        return {
-            status: 'PAUSED_FOR_HITL',
-            stepIndex: 3,
-            memory,
-        };
+        return { status: 'PAUSED_FOR_HITL', stepIndex: 3, memory };
     }
 
-    // [Mục 7.5] Đánh thức (Resume) Agent từ Checkpoint sau khi Trọng tài viên bấm phê duyệt HITL
     async approveAndResumeHitl(params: {
         threadId: string;
         arbitratorJwt: AuthContext;
@@ -238,12 +219,12 @@ export class AutonomousDisputeAgent {
         }
 
         const memory = latestCheckpoint.working_memory;
-
-        // Tái sử dụng trực tiếp tầng EscrowV1Service từ Giai đoạn 5 ("Một tầng Services — Ba cổng giao tiếp")
-        const settlement = await this.escrowV1Service.releaseMilestone({
+        const settlement = await this.escrowV1Service.settleDisputeSplit({
             contractId: memory.contractId,
             milestoneId: memory.milestoneId,
             callerOrgId: params.arbitratorJwt.organizationId,
+            buyerRefundPct: memory.proposedBuyerRefundPct,
+            sellerPayoutPct: memory.proposedSellerPayoutPct,
             idempotencyKey: params.idempotencyKey,
         });
 
@@ -254,7 +235,12 @@ export class AutonomousDisputeAgent {
             jwtContext: params.arbitratorJwt,
             toolName: 'execute_arbitration_payout',
             riskTier: 2,
-            inputPayload: { milestoneId: memory.milestoneId, referenceCode: settlement.referenceCode },
+            inputPayload: {
+                milestoneId: memory.milestoneId,
+                buyerRefundPct: memory.proposedBuyerRefundPct,
+                sellerPayoutPct: memory.proposedSellerPayoutPct,
+                referenceCode: settlement.referenceCode,
+            },
             decisionStatus: 'HITL_APPROVED_AND_SETTLED',
         });
 
@@ -267,14 +253,9 @@ export class AutonomousDisputeAgent {
             memory,
         });
 
-        return {
-            status: 'COMPLETED',
-            stepIndex: nextStep,
-            memory,
-        };
+        return { status: 'COMPLETED', stepIndex: nextStep, memory };
     }
 
-    // [Mục 7.3] TIME-TRAVEL DEBUGGING: Tua ngược về bất kỳ bước nào của Agent trong quá khứ
     async timeTravelInspect(threadId: string, stepIndex: number): Promise<{
         nodeName: string;
         status: string;
@@ -285,28 +266,16 @@ export class AutonomousDisputeAgent {
             status: string;
             working_memory: AgentWorkingMemory;
         }>(
-            `SELECT node_name, status, working_memory
-       FROM agent_checkpoints
-       WHERE thread_id = $1 AND step_index = $2`,
+            `SELECT node_name, status, working_memory FROM agent_checkpoints WHERE thread_id = $1 AND step_index = $2`,
             [threadId, stepIndex]
         );
 
         const row = res.rows[0];
-        if (!row) {
-            throw new AppError(404, 'CHECKPOINT_NOT_FOUND', `Không tìm thấy mốc Time-Travel tại bước ${stepIndex}.`);
-        }
-
-        return {
-            nodeName: row.node_name,
-            status: row.status,
-            memory: row.working_memory,
-        };
+        if (!row) throw new AppError(404, 'CHECKPOINT_NOT_FOUND', `Không tìm thấy mốc Time-Travel tại bước ${stepIndex}.`);
+        return { nodeName: row.node_name, status: row.status, memory: row.working_memory };
     }
 }
 
-// ============================================================================
-// [Mục 7.5] CỔNG GIAO TIẾP THỨ BA: FINESCROW MCP SERVER (Model Context Protocol)
-// ============================================================================
 export class FinEscrowMcpServer {
     constructor(private readonly ragService: RagV2Service) { }
 
